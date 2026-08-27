@@ -2,6 +2,13 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 import os
+import sqlite3
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ModuleNotFoundError:
+    def st_autorefresh(interval, key):
+        return None
 
 
 
@@ -184,7 +191,14 @@ st.markdown("""
 # THAI AIRWAYS LOGO URL
 THAI_AIRWAYS_LOGO = "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRhM8flXc45jVMih04D-lvtqbOvOVkMxdCjGXH2xOlwLA&s=10"
 
+LICENSE_DATABASE_FILE = "manpower_license_data 2.db"
 EXCEL_LICENSE_FILE = "manpower_license_data 2.xlsx"
+STORE_DATABASE_FILE = "store_inventory.db"
+SCHEDULE_DATABASE_FILE = "flight_schedule.db"
+LICENSE_COLUMNS = [
+    "Personal ID", "Full Name", "Department", "Position", "Employment Status",
+    "Privilages", "License No.", "Issue Date", "Expiry Date"
+]
 
 # Mapping Aircraft Type -> Required License Privilege
 AIRCRAFT_PRIVILEGE_MAP = {
@@ -210,27 +224,47 @@ DEFAULT_CONTRACTS = {
 # ==============================================================================
 @st.cache_data(ttl=1)
 def load_license_data():
-    if not os.path.exists(EXCEL_LICENSE_FILE):
-        cols = ["Personal ID", "Full Name", "Department", "Position", "Employment Status", 
-                "Privilages", "License No.", "Issue Date", "Expiry Date"]
-        df_empty = pd.DataFrame(columns=cols)
-        df_empty.to_excel(EXCEL_LICENSE_FILE, sheet_name="Manpower_Licenses", index=False)
-        return df_empty
-    
-    df = pd.read_excel(EXCEL_LICENSE_FILE, sheet_name="Manpower_Licenses")
-    df["Issue Date"] = pd.to_datetime(df["Issue Date"]).dt.date
-    df["Expiry Date"] = pd.to_datetime(df["Expiry Date"]).dt.date
+    database_exists = os.path.exists(LICENSE_DATABASE_FILE)
+    with sqlite3.connect(LICENSE_DATABASE_FILE) as connection:
+        connection.execute(f"""
+            CREATE TABLE IF NOT EXISTS manpower_license_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                "Personal ID" TEXT NOT NULL,
+                "Full Name" TEXT NOT NULL,
+                "Department" TEXT,
+                "Position" TEXT,
+                "Employment Status" TEXT,
+                "Privilages" TEXT,
+                "License No." TEXT,
+                "Issue Date" TEXT,
+                "Expiry Date" TEXT
+            )
+        """)
+
+        if not database_exists and os.path.exists(EXCEL_LICENSE_FILE):
+            legacy_df = pd.read_excel(EXCEL_LICENSE_FILE, sheet_name="Manpower_Licenses")
+            legacy_df = legacy_df.reindex(columns=LICENSE_COLUMNS)
+            legacy_df.to_sql("manpower_license_data", connection, if_exists="append", index=False)
+
+        df = pd.read_sql_query(
+            'SELECT "Personal ID", "Full Name", "Department", "Position", '
+            '"Employment Status", "Privilages", "License No.", "Issue Date", "Expiry Date" '
+            'FROM manpower_license_data ORDER BY id',
+            connection,
+        )
+
+    for column in ["Issue Date", "Expiry Date"]:
+        df[column] = pd.to_datetime(df[column], errors="coerce").dt.date
     return df
 
 def save_license_data(df):
-    raw_cols = [
-        "Personal ID", "Full Name", "Department", "Position", 
-        "Employment Status", "Privilages", "License No.", 
-        "Issue Date", "Expiry Date"
-    ]
-    df_to_save = df[[col for col in raw_cols if col in df.columns]]
-    with pd.ExcelWriter(EXCEL_LICENSE_FILE, engine="openpyxl") as writer:
-        df_to_save.to_excel(writer, sheet_name="Manpower_Licenses", index=False)
+    df_to_save = df.reindex(columns=LICENSE_COLUMNS).copy()
+    for column in ["Issue Date", "Expiry Date"]:
+        df_to_save[column] = pd.to_datetime(df_to_save[column], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    with sqlite3.connect(LICENSE_DATABASE_FILE) as connection:
+        connection.execute("DELETE FROM manpower_license_data")
+        df_to_save.to_sql("manpower_license_data", connection, if_exists="append", index=False)
     st.cache_data.clear()
 
 def calculate_status(expiry_date, warning_days=90):
@@ -360,18 +394,74 @@ def get_default_store_data():
     ]
     return pd.DataFrame(raw_data)
 
+STORE_COLUMNS = [
+    "Item", "Description", "P/N", "S/N", "EQ Code", "QTY", "Location",
+    "Next Inspection / Status", "Source"
+]
+
+@st.cache_data
+def load_store_data():
+    database_exists = os.path.exists(STORE_DATABASE_FILE)
+    with sqlite3.connect(STORE_DATABASE_FILE) as connection:
+        connection.execute('''
+            CREATE TABLE IF NOT EXISTS store_inventory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                "Item" INTEGER,
+                "Description" TEXT,
+                "P/N" TEXT,
+                "S/N" TEXT,
+                "EQ Code" TEXT,
+                "QTY" TEXT,
+                "Location" TEXT,
+                "Next Inspection / Status" TEXT,
+                "Source" TEXT
+            )
+        ''')
+
+        if not database_exists:
+            get_default_store_data().reindex(columns=STORE_COLUMNS).to_sql(
+                "store_inventory", connection, if_exists="append", index=False
+            )
+
+        return pd.read_sql_query(
+            'SELECT "Item", "Description", "P/N", "S/N", "EQ Code", "QTY", '
+            '"Location", "Next Inspection / Status", "Source" '
+            'FROM store_inventory ORDER BY id',
+            connection,
+        )
+
+def save_store_data(df):
+    df_to_save = df.reindex(columns=STORE_COLUMNS).copy()
+    with sqlite3.connect(STORE_DATABASE_FILE) as connection:
+        connection.execute("DELETE FROM store_inventory")
+        df_to_save.to_sql("store_inventory", connection, if_exists="append", index=False)
+    st.cache_data.clear()
+
 # ==============================================================================
 # ⚙️ HELPER FUNCTIONS FOR FLIGHT ASSIGNMENT SYSTEM
 # ==============================================================================
 def parse_flight_assignment_excel(uploaded_file):
-    df_raw = pd.read_excel(uploaded_file, header=None)
+    excel_file = pd.ExcelFile(uploaded_file)
+    if not excel_file.sheet_names:
+        raise ValueError("The uploaded Excel workbook contains no worksheets.")
 
-    header_idx = 1
-    for idx, row in df_raw.iterrows():
-        row_str = " ".join([str(val) for val in row.values])
-        if "FLT" in row_str and "A/L" in row_str:
-            header_idx = idx
+    latest_sheet = None
+    df_raw = None
+    header_idx = None
+    for sheet_name in reversed(excel_file.sheet_names):
+        candidate = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
+        for idx, row in candidate.iterrows():
+            row_str = " ".join(str(val).strip().upper() for val in row.values)
+            if "FLT" in row_str and "A/L" in row_str:
+                latest_sheet = sheet_name
+                df_raw = candidate
+                header_idx = idx
+                break
+        if latest_sheet is not None:
             break
+
+    if latest_sheet is None or df_raw is None or header_idx is None:
+        raise ValueError("Could not find a flight schedule sheet with FLT and A/L headers.")
 
     df_flight = df_raw.iloc[header_idx + 1:, 0:14].copy()
     df_flight.columns = [
@@ -412,6 +502,43 @@ def get_unique_mechanics_count(df_flight):
     
     unique_mechs = set(m1 + m2 + lae)
     return len(unique_mechs), sorted(list(unique_mechs))
+
+def save_schedule_data(df_flight, df_staff, source_file):
+    with sqlite3.connect(SCHEDULE_DATABASE_FILE) as connection:
+        df_flight.to_sql("flight_schedule", connection, if_exists="replace", index=False)
+        df_staff.to_sql("schedule_staff", connection, if_exists="replace", index=False)
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS schedule_metadata "
+            "(id INTEGER PRIMARY KEY CHECK (id = 1), source_file TEXT, uploaded_at TEXT)"
+        )
+        connection.execute("DELETE FROM schedule_metadata")
+        connection.execute(
+            "INSERT INTO schedule_metadata (id, source_file, uploaded_at) VALUES (1, ?, ?)",
+            (source_file, datetime.now().isoformat(timespec="seconds")),
+        )
+
+def load_schedule_data():
+    if not os.path.exists(SCHEDULE_DATABASE_FILE):
+        return None, None, None
+
+    with sqlite3.connect(SCHEDULE_DATABASE_FILE) as connection:
+        tables = pd.read_sql_query(
+            "SELECT name FROM sqlite_master WHERE type='table'", connection
+        )["name"].tolist()
+        required_tables = {"flight_schedule", "schedule_staff", "schedule_metadata"}
+        if not required_tables.issubset(tables):
+            return None, None, None
+        df_flight = pd.read_sql_query("SELECT * FROM flight_schedule", connection)
+        df_staff = pd.read_sql_query("SELECT * FROM schedule_staff", connection)
+        metadata = pd.read_sql_query(
+            "SELECT source_file, uploaded_at FROM schedule_metadata WHERE id = 1",
+            connection,
+        )
+
+    schedule_info = None
+    if not metadata.empty:
+        schedule_info = (metadata.iloc[0]["source_file"], metadata.iloc[0]["uploaded_at"])
+    return df_flight, df_staff, schedule_info
 
 # ==============================================================================
 # 📌 SIDEBAR NAVIGATION (RESTORED SELECTBOX & PURPLE TEXT)
@@ -456,13 +583,28 @@ st.markdown(f"""
 if system_mode == "✈️ Flight & Work Assignment":
     st.title("✈️ Flight Schedule & Work Assignment System")
     st.caption("Extract and analyze flight schedules, aircraft types, assigned mechanics, and shift distribution.")
+    st_autorefresh(interval=10000, key="schedule_refresh")
     
     with st.container(border=True):
-        uploaded_file = st.file_uploader("📂 Upload Daily Schedule Excel File (e.g., TUE 28 JUL 2026.xlsx)", type=["xlsx", "xls"])
+        uploaded_files = st.file_uploader(
+            "📂 Upload Daily Schedule Excel File(s) (e.g., TUE 28 JUL 2026.xlsx)",
+            type=["xlsx", "xls"],
+            accept_multiple_files=True,
+        )
 
-    if uploaded_file is not None:
+    if uploaded_files or os.path.exists(SCHEDULE_DATABASE_FILE):
         try:
-            df_flight, df_staff = parse_flight_assignment_excel(uploaded_file)
+            if uploaded_files:
+                uploaded_file = uploaded_files[-1]
+                st.caption(f"Reading latest uploaded file: {uploaded_file.name}")
+                df_flight, df_staff = parse_flight_assignment_excel(uploaded_file)
+                save_schedule_data(df_flight, df_staff, uploaded_file.name)
+            else:
+                df_flight, df_staff, schedule_info = load_schedule_data()
+                if df_flight is None:
+                    raise ValueError("The saved schedule database is not available.")
+                source_file, uploaded_at = schedule_info
+                st.caption(f"Latest shared schedule: {source_file} (uploaded {uploaded_at})")
             unique_mech_count, unique_mech_list = get_unique_mechanics_count(df_flight)
 
             valid_flights = len(df_flight[df_flight['AIRLINE'].notna() & (df_flight['AIRLINE'].astype(str).str.strip() != '')])
@@ -626,7 +768,9 @@ elif system_mode == "📜 Manpower & License Management":
             st.warning("No license records found. Please add entries in the 'Add New Entry' tab.")
         else:
             total_emp = df_lic["Personal ID"].nunique()
-            total_licenses = len(df_lic[df_lic["Privilages"].notna()])
+            privilege_values = df_lic["Privilages"].fillna("").astype(str).str.strip().str.upper()
+            excluded_privileges = {"", "NONE", "N/A", "-", "NULL", "NAN"}
+            total_licenses = (~privilege_values.isin(excluded_privileges)).sum()
             active_cnt = sum(df_lic["License Status"] == "Active")
             expiring_cnt = sum(df_lic["License Status"] == "Expiring Soon")
             expired_cnt = sum(df_lic["License Status"] == "Expired")
@@ -654,8 +798,22 @@ elif system_mode == "📜 Manpower & License Management":
                     )
 
             st.write("### 📜 Recent License Records")
-            styled_df = df_lic.style.map(color_status_badges, subset=["License Status"])
-            st.dataframe(styled_df, use_container_width=True, hide_index=True)
+            st.caption("Edit personnel or license information directly, then save your changes.")
+            editable_license_df = df_lic[LICENSE_COLUMNS].copy()
+            edited_license_df = st.data_editor(
+                editable_license_df,
+                use_container_width=True,
+                hide_index=True,
+                key="recent_license_records_editor",
+                column_config={
+                    "Issue Date": st.column_config.DateColumn("Issue Date"),
+                    "Expiry Date": st.column_config.DateColumn("Expiry Date"),
+                },
+            )
+            if st.button("💾 Save License Updates", use_container_width=True):
+                save_license_data(edited_license_df)
+                st.success("License information updated successfully.")
+                st.rerun()
 
     elif menu == "🚨 License Alerts":
         st.title("🚨 License Expiry Monitoring")
@@ -740,7 +898,7 @@ elif system_mode == "📦 Store & Inventory Management":
     st.title("📦 Technical Store & Inspection Alert System")
     st.caption("Phuket Station Inventory Database & Expiration / Calibration Monitoring")
 
-    df_store = get_default_store_data()
+    df_store = load_store_data()
 
     with st.container(border=True):
         col_warn, _ = st.columns([1, 1])
@@ -805,9 +963,20 @@ elif system_mode == "📦 Store & Inventory Management":
 
     with tab_all_store:
         with st.container(border=True):
-            st.subheader("📦 Master Inventory List with Status Badges")
-            styled_store = df_store.style.map(color_store_status, subset=["Inspection Status"])
-            st.dataframe(styled_store, use_container_width=True, hide_index=True)
+            st.subheader("📦 Update Inventory Master List")
+            st.caption("Edit cells or use the table menu to add and delete inventory rows.")
+            editable_store_df = df_store[STORE_COLUMNS].copy()
+            edited_store_df = st.data_editor(
+                editable_store_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                hide_index=True,
+                key="store_inventory_editor",
+            )
+            if st.button("💾 Save Inventory Updates", use_container_width=True):
+                save_store_data(edited_store_df)
+                st.success("Inventory list updated successfully.")
+                st.rerun()
 
     with tab_filter_source:
         with st.container(border=True):
